@@ -65,6 +65,44 @@ async def async_summarize_twitter():
     # TODO: implement
 
 
+@main.command("print")
+@click.option(
+    "--content", required=True, help="Content to print (plain text or markdown)."
+)
+@click.option(
+    "--printer",
+    required=True,
+    help="Name of the printer. Use list-printers to see available printers.",
+)
+@coro
+async def async_print(content: str, printer: str):
+    """Prints content to the specified printer."""
+    from jc_news.printing import PrintingError, print_content
+
+    try:
+        print_content(content, printer)
+        click.echo(f"Sent to printer '{printer}'.")
+    except PrintingError as e:
+        raise click.ClickException(str(e))
+
+
+@main.command("list-printers")
+@coro
+async def async_list_printers():
+    """Lists available printers on the local network."""
+    from jc_news.printing import PrintingError, list_printers
+
+    try:
+        printers = list_printers()
+        if not printers:
+            click.echo("No printers found.")
+        else:
+            for p in printers:
+                click.echo(p)
+    except PrintingError as e:
+        raise click.ClickException(str(e))
+
+
 def _check_path():
     """Confirms required CLIs are in the path.
 
