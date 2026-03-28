@@ -10,14 +10,19 @@ import asyncio
 import shutil
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable, Coroutine
 from functools import wraps
 from pathlib import Path
 from typing import Any
 
+import aiohttp
 import click
 import mistune
 import weasyprint
+
+_HN_API = "https://hacker-news.firebaseio.com/v0"
+_HN_TOP_N = 10
 
 _LAYOUT_CSS = """\
 @page {
@@ -59,6 +64,37 @@ def layout_markdown(content: str) -> bytes:
     return weasyprint.HTML(string=full_html).write_pdf()
 
 
+async def fetch_hn(session: aiohttp.ClientSession) -> str:
+    """Fetch top 10 HN posts from the last 48 hours, return as markdown."""
+    cutoff = time.time() - 48 * 60 * 60
+    async with session.get(f"{_HN_API}/topstories.json") as resp:
+        resp.raise_for_status()
+        story_ids: list[int] = await resp.json()
+
+    posts: list[dict[str, Any]] = []
+    for story_id in story_ids:
+        if len(posts) >= _HN_TOP_N:
+            break
+        async with session.get(f"{_HN_API}/item/{story_id}.json") as resp:
+            resp.raise_for_status()
+            item: dict[str, Any] = await resp.json()
+        if item and item.get("time", 0) >= cutoff:
+            posts.append(item)
+
+    lines: list[str] = []
+    for i, post in enumerate(posts, 1):
+        title = post.get("title", "Untitled")
+        url = post.get("url", "")
+        score = post.get("score", 0)
+        author = post.get("by", "unknown")
+        lines.append(f"## {i}. {title}\n")
+        if url:
+            lines.append(f"{url}\n")
+        lines.append(f"{score} points by {author}\n")
+        lines.append("")
+    return "\n".join(lines)
+
+
 class PrintingError(Exception):
     """Raised when a printing operation fails."""
 
@@ -94,7 +130,16 @@ async def async_run(dry_run: bool) -> None:
 @coro
 async def async_fetch_hn() -> None:
     """Fetch top HN posts in the last 48 hours. Write to markdown file."""
-    raise NotImplementedError
+    async with aiohttp.ClientSession() as session:
+        md = await fetch_hn(session)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".md",
+        delete=False,
+        prefix="hn-",
+    ) as f:
+        f.write(md)
+        click.echo(f"Wrote {f.name}")
 
 
 @main.command("fetch-twitter")

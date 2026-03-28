@@ -5,7 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 authors = [{ name = "Justin Chapman", email = "commonmodestudio@gmail.com" }]
 requires-python = ">=3.13"
-dependencies = ["click>=8.3.1", "mistune>=3.1.0", "weasyprint>=63.0"]
+dependencies = ["aiohttp>=3.11.0", "click>=8.3.1", "mistune>=3.1.0", "weasyprint>=63.0"]
 
 [project.scripts]
 jc-news = "jc_news:main"
