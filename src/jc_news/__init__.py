@@ -9,12 +9,54 @@ The example module supplies one function, factorial().  For example,
 import asyncio
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Callable, Coroutine
 from functools import wraps
 from pathlib import Path
 from typing import Any
 
 import click
+import mistune
+import weasyprint
+
+_LAYOUT_CSS = """\
+@page {
+    size: letter;
+    margin: 0.75in;
+}
+body {
+    column-count: 2;
+    column-gap: 0.3in;
+    column-rule: 1px solid #ccc;
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 10pt;
+    line-height: 1.4;
+    margin: 0;
+    padding: 0;
+}
+h1 { font-size: 16pt; font-weight: bold; margin: 0.3em 0; }
+h2 { font-size: 13pt; font-weight: bold; margin: 0.3em 0; }
+h3 { font-size: 11pt; font-weight: bold; margin: 0.3em 0; }
+ul, ol { margin: 0.2em 0; padding-left: 1.2em; }
+li { margin: 0.1em 0; }
+hr { border: none; border-top: 1px solid #999; margin: 0.5em 0; }
+p { margin: 0.3em 0; }
+"""
+
+_LAYOUT_HTML = """\
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><style>{css}</style></head>
+<body>{content}</body>
+</html>
+"""
+
+
+def layout_markdown(content: str) -> bytes:
+    """Convert markdown to newspaper-style PDF bytes for 8.5x11 paper."""
+    html_body = mistune.html(content)
+    full_html = _LAYOUT_HTML.format(css=_LAYOUT_CSS, content=html_body)
+    return weasyprint.HTML(string=full_html).write_pdf()
 
 
 class PrintingError(Exception):
@@ -149,16 +191,33 @@ def list_printers() -> list[str]:
     return printers
 
 
-def print_content(content: str, printer: str) -> None:
-    """Send content to the named printer via lp."""
+def print_content(content: str | bytes, printer: str) -> None:
+    """Send content to the named printer via lp.
+
+    Accepts plain text (str) or PDF bytes.
+    """
     lp = _find_cups()
-    result = subprocess.run(  # noqa: S603
-        [lp, "-d", printer],
-        input=content,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    if isinstance(content, bytes):
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            f.write(content)
+            tmp_path = f.name
+        try:
+            result = subprocess.run(  # noqa: S603
+                [lp, "-d", printer, tmp_path],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+    else:
+        result = subprocess.run(  # noqa: S603
+            [lp, "-d", printer],
+            input=content,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
     if result.returncode != 0:
         msg = f"Failed to print: {result.stderr.strip()}"
         raise PrintingError(msg)
