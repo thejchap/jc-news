@@ -20,9 +20,13 @@ import aiohttp
 import click
 import mistune
 import weasyprint
+from bs4 import BeautifulSoup
+from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
 _HN_API = "https://hacker-news.firebaseio.com/v0"
 _HN_TOP_N = 10
+_HN_TOP_COMMENTS = 5
+_ARTICLE_MAX_CHARS = 2000
 
 _LAYOUT_CSS = """\
 @page {
@@ -64,6 +68,110 @@ def layout_markdown(content: str) -> bytes:
     return weasyprint.HTML(string=full_html).write_pdf()
 
 
+async def _fetch_article_text(
+    session: aiohttp.ClientSession,
+    url: str,
+) -> str:
+    """Fetch a URL and extract readable text content."""
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            resp.raise_for_status()
+            html = await resp.text()
+    except (aiohttp.ClientError, TimeoutError):
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "nav", "header", "footer"]):
+        tag.decompose()
+    article = soup.find("article") or soup.find("main") or soup.body
+    if not article:
+        return ""
+    text = article.get_text(separator="\n", strip=True)
+    if len(text) > _ARTICLE_MAX_CHARS:
+        text = text[:_ARTICLE_MAX_CHARS] + "..."
+    return text
+
+
+async def _fetch_comments(
+    session: aiohttp.ClientSession,
+    kid_ids: list[int],
+) -> list[str]:
+    """Fetch top comments by id, return list of comment texts."""
+    comments: list[str] = []
+    for kid_id in kid_ids[:_HN_TOP_COMMENTS]:
+        async with session.get(f"{_HN_API}/item/{kid_id}.json") as resp:
+            resp.raise_for_status()
+            item: dict[str, Any] = await resp.json()
+        if not item or item.get("deleted") or item.get("dead"):
+            continue
+        text = item.get("text", "")
+        if text:
+            soup = BeautifulSoup(text, "html.parser")
+            clean = soup.get_text(separator=" ", strip=True)
+            author = item.get("by", "unknown")
+            comments.append(f"**{author}:** {clean}")
+    return comments
+
+
+async def _format_post(
+    session: aiohttp.ClientSession,
+    i: int,
+    post: dict[str, Any],
+) -> list[str]:
+    """Render a single HN post as markdown lines."""
+    title = post.get("title", "Untitled")
+    url = post.get("url", "")
+    score = post.get("score", 0)
+    author = post.get("by", "unknown")
+
+    lines: list[str] = [f"## {i}. {title}\n"]
+    if url:
+        lines.append(f"{url}\n")
+    lines.append(f"{score} points by {author}\n")
+
+    if url:
+        article_text = await _fetch_article_text(session, url)
+        if article_text:
+            lines.append(f"\n{article_text}\n")
+    elif post.get("text"):
+        soup = BeautifulSoup(post["text"], "html.parser")
+        lines.append(f"\n{soup.get_text(separator=' ', strip=True)}\n")
+
+    kid_ids: list[int] = post.get("kids", [])
+    if kid_ids:
+        comments = await _fetch_comments(session, kid_ids)
+        if comments:
+            lines.append("\n### Comments\n")
+            lines.extend(f"- {c}\n" for c in comments)
+
+    lines.append("\n---\n")
+    return lines
+
+
+_SUMMARIZE_SYSTEM = (
+    "You are a news summarizer. For each Hacker News post, write a 1-2 sentence "
+    "summary of the post and a brief note on the sentiment of the comments. "
+    "Use markdown formatting with the post title as a heading."
+)
+
+
+async def summarize_hn(session: aiohttp.ClientSession) -> str:
+    """Fetch top HN posts, then summarize each with comment sentiment via Claude."""
+    md = await fetch_hn(session)
+    result: str = ""
+    async for message in query(
+        prompt=md,
+        options=ClaudeAgentOptions(
+            system_prompt=_SUMMARIZE_SYSTEM,
+            model="claude-haiku-4-5",
+            allowed_tools=[],
+            max_turns=1,
+        ),
+    ):
+        if isinstance(message, ResultMessage) and message.result:
+            result = message.result
+    return result
+
+
 async def fetch_hn(session: aiohttp.ClientSession) -> str:
     """Fetch top 10 HN posts from the last 48 hours, return as markdown."""
     cutoff = time.time() - 48 * 60 * 60
@@ -83,15 +191,7 @@ async def fetch_hn(session: aiohttp.ClientSession) -> str:
 
     lines: list[str] = []
     for i, post in enumerate(posts, 1):
-        title = post.get("title", "Untitled")
-        url = post.get("url", "")
-        score = post.get("score", 0)
-        author = post.get("by", "unknown")
-        lines.append(f"## {i}. {title}\n")
-        if url:
-            lines.append(f"{url}\n")
-        lines.append(f"{score} points by {author}\n")
-        lines.append("")
+        lines.extend(await _format_post(session, i, post))
     return "\n".join(lines)
 
 
@@ -153,7 +253,16 @@ async def async_fetch_twitter() -> None:
 @coro
 async def async_summarize_hn() -> None:
     """Summarizes HN feed in markdown file."""
-    raise NotImplementedError
+    async with aiohttp.ClientSession() as session:
+        md = await summarize_hn(session)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".md",
+        delete=False,
+        prefix="hn-summary-",
+    ) as f:
+        f.write(md)
+        click.echo(f"Wrote {f.name}")
 
 
 @main.command("summarize-twitter")
@@ -226,8 +335,10 @@ def list_printers() -> list[str]:
     """Return list of available printer names via lpstat -a."""
     lp = _find_cups()
     lpstat = str(Path(lp).parent / "lpstat")
-    result = subprocess.run([lpstat, "-a"], capture_output=True, text=True, check=True)  # noqa: S603
+    result = subprocess.run([lpstat, "-a"], capture_output=True, text=True, check=False)  # noqa: S603
     if result.returncode != 0:
+        if "No destinations" in result.stderr:
+            return []
         msg = f"Failed to list printers: {result.stderr.strip()}"
         raise PrintingError(msg)
     printers: list[str] = [

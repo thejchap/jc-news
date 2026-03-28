@@ -2,6 +2,7 @@ import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from claude_agent_sdk import ResultMessage
 from tryke import describe, expect, test
 
 from jc_news import (
@@ -11,6 +12,7 @@ from jc_news import (
     layout_markdown,
     list_printers,
     print_content,
+    summarize_hn,
 )
 
 with describe("printing"):
@@ -48,7 +50,7 @@ with describe("printing"):
                 ["/usr/bin/lpstat", "-a"],
                 capture_output=True,
                 text=True,
-                check=True,
+                check=False,
             )
 
     @test("list_printers returns empty list when no printers")
@@ -56,6 +58,18 @@ with describe("printing"):
         mock_result = MagicMock()
         mock_result.returncode = 0
         mock_result.stdout = ""
+        with (
+            patch("jc_news.shutil.which", return_value="/usr/bin/lp"),
+            patch("jc_news.subprocess.run", return_value=mock_result),
+        ):
+            printers = list_printers()
+            expect(printers, "printer list").to_equal([])
+
+    @test("list_printers returns empty list when lpstat says no destinations")
+    def test_list_printers_no_destinations():
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stderr = "lpstat: No destinations added."
         with (
             patch("jc_news.shutil.which", return_value="/usr/bin/lp"),
             patch("jc_news.subprocess.run", return_value=mock_result),
@@ -141,82 +155,116 @@ with describe("layout"):
         expect(result[:5], "PDF header").to_equal(b"%PDF-")
 
 
-def _make_mock_session(story_ids: list[int], items: list[dict]) -> AsyncMock:
-    """Build a mock aiohttp session that returns given data."""
+def _make_resp(
+    json_data: object = None,
+    text_data: str = "",
+    *,
+    is_json: bool = True,
+) -> AsyncMock:
+    """Build a single mock aiohttp response."""
+    resp = AsyncMock()
+    resp.raise_for_status = MagicMock()
+    if is_json:
+        resp.json = AsyncMock(return_value=json_data)
+    resp.text = AsyncMock(return_value=text_data)
+    resp.__aenter__ = AsyncMock(return_value=resp)
+    resp.__aexit__ = AsyncMock(return_value=False)
+    return resp
+
+
+def _make_mock_session(responses: list[AsyncMock]) -> AsyncMock:
+    """Build a mock aiohttp session from ordered responses."""
     session = AsyncMock()
-    responses = []
-    # First call is topstories
-    top_resp = AsyncMock()
-    top_resp.raise_for_status = MagicMock()
-    top_resp.json = AsyncMock(return_value=story_ids)
-    top_resp.__aenter__ = AsyncMock(return_value=top_resp)
-    top_resp.__aexit__ = AsyncMock(return_value=False)
-    responses.append(top_resp)
-    # Subsequent calls are individual items
-    for item in items:
-        item_resp = AsyncMock()
-        item_resp.raise_for_status = MagicMock()
-        item_resp.json = AsyncMock(return_value=item)
-        item_resp.__aenter__ = AsyncMock(return_value=item_resp)
-        item_resp.__aexit__ = AsyncMock(return_value=False)
-        responses.append(item_resp)
     session.get = MagicMock(side_effect=responses)
     return session
 
 
 with describe("fetch_hn"):
 
-    @test("returns markdown with top posts")
+    @test("returns markdown with top posts, content, and comments")
     def test_fetch_hn_basic():
         now = int(time.time())
-        items = [
-            {
-                "id": 1,
-                "title": "Post One",
-                "url": "https://example.com/1",
-                "score": 100,
-                "by": "alice",
-                "time": now,
-            },
-            {
-                "id": 2,
-                "title": "Post Two",
-                "url": "https://example.com/2",
-                "score": 50,
-                "by": "bob",
-                "time": now,
-            },
+        post = {
+            "id": 1,
+            "title": "Post One",
+            "url": "https://example.com/1",
+            "score": 100,
+            "by": "alice",
+            "time": now,
+            "kids": [101, 102],
+        }
+        comment1 = {
+            "id": 101,
+            "by": "commenter1",
+            "text": "Great article!",
+        }
+        comment2 = {
+            "id": 102,
+            "by": "commenter2",
+            "text": "Interesting read.",
+        }
+        article_html = "<html><body><p>Article body text.</p></body></html>"
+        responses = [
+            _make_resp(json_data=[1]),  # topstories
+            _make_resp(json_data=post),  # item/1
+            _make_resp(text_data=article_html, is_json=False),  # article
+            _make_resp(json_data=comment1),  # comment 101
+            _make_resp(json_data=comment2),  # comment 102
         ]
-        session = _make_mock_session([1, 2], items)
+        session = _make_mock_session(responses)
         md = asyncio.run(fetch_hn(session))
-        expect("Post One" in md, "contains first title").to_equal(True)
-        expect("Post Two" in md, "contains second title").to_equal(True)
-        expect("https://example.com/1" in md, "contains first url").to_equal(True)
-        expect("100 points by alice" in md, "contains score/author").to_equal(True)
+        expect("Post One" in md, "contains title").to_equal(True)
+        expect("100 points by alice" in md, "contains score").to_equal(True)
+        expect("Article body text." in md, "contains article").to_equal(True)
+        expect("commenter1" in md, "contains commenter1").to_equal(True)
+        expect("Great article!" in md, "contains comment1").to_equal(True)
+        expect("Interesting read." in md, "contains comment2").to_equal(True)
+
+    @test("includes self-post text when no url")
+    def test_fetch_hn_self_post():
+        now = int(time.time())
+        post = {
+            "id": 1,
+            "title": "Ask HN: Something",
+            "text": "<p>Self post body here.</p>",
+            "score": 30,
+            "by": "poster",
+            "time": now,
+        }
+        responses = [
+            _make_resp(json_data=[1]),
+            _make_resp(json_data=post),
+        ]
+        session = _make_mock_session(responses)
+        md = asyncio.run(fetch_hn(session))
+        expect("Self post body here." in md, "contains self text").to_equal(True)
 
     @test("skips posts older than 48 hours")
     def test_fetch_hn_filters_old():
         now = int(time.time())
         old = now - 49 * 60 * 60
-        items = [
-            {
-                "id": 1,
-                "title": "Old Post",
-                "url": "",
-                "score": 10,
-                "by": "x",
-                "time": old,
-            },
-            {
-                "id": 2,
-                "title": "New Post",
-                "url": "",
-                "score": 20,
-                "by": "y",
-                "time": now,
-            },
+        old_post = {
+            "id": 1,
+            "title": "Old Post",
+            "url": "",
+            "score": 10,
+            "by": "x",
+            "time": old,
+        }
+        new_post = {
+            "id": 2,
+            "title": "New Post",
+            "url": "",
+            "score": 20,
+            "by": "y",
+            "time": now,
+        }
+        responses = [
+            _make_resp(json_data=[1, 2]),
+            _make_resp(json_data=old_post),
+            _make_resp(json_data=new_post),
         ]
-        session = _make_mock_session([1, 2], items)
+        session = _make_mock_session(responses)
         md = asyncio.run(fetch_hn(session))
         expect("Old Post" in md, "old post excluded").to_equal(False)
         expect("New Post" in md, "new post included").to_equal(True)
@@ -236,7 +284,73 @@ with describe("fetch_hn"):
             }
             for i in ids
         ]
-        session = _make_mock_session(ids, items)
+        responses = [_make_resp(json_data=ids)]
+        responses.extend(_make_resp(json_data=item) for item in items)
+        session = _make_mock_session(responses)
         md = asyncio.run(fetch_hn(session))
         expect("Post 10" in md, "has 10th post").to_equal(True)
         expect("Post 11" in md, "no 11th post").to_equal(False)
+
+    @test("skips deleted and dead comments")
+    def test_fetch_hn_skips_bad_comments():
+        now = int(time.time())
+        post = {
+            "id": 1,
+            "title": "Post",
+            "url": "",
+            "score": 5,
+            "by": "u",
+            "time": now,
+            "kids": [101, 102],
+        }
+        deleted = {"id": 101, "deleted": True}
+        alive = {
+            "id": 102,
+            "by": "alive_user",
+            "text": "I am alive",
+        }
+        responses = [
+            _make_resp(json_data=[1]),
+            _make_resp(json_data=post),
+            _make_resp(json_data=deleted),
+            _make_resp(json_data=alive),
+        ]
+        session = _make_mock_session(responses)
+        md = asyncio.run(fetch_hn(session))
+        expect("alive_user" in md, "alive comment present").to_equal(True)
+        expect("I am alive" in md, "alive text present").to_equal(True)
+
+
+with describe("summarize_hn"):
+
+    @test("calls fetch_hn then sends markdown to Claude for summarization")
+    def test_summarize_hn_basic():
+        fake_md = "## 1. Test Post\n100 points by alice\n\nArticle text.\n"
+        summary_text = (
+            "## Test Post\nSummary: A test post about articles.\n"
+            "Comment Sentiment: Generally positive.\n"
+        )
+        result_msg = ResultMessage(
+            result=summary_text,
+            stop_reason="end_turn",
+            subtype="result",
+            duration_ms=100,
+            duration_api_ms=80,
+            is_error=False,
+            num_turns=1,
+            session_id="test-session",
+        )
+
+        async def mock_query(*_args: object, **_kwargs: object):  # noqa: ANN202
+            yield result_msg
+
+        with (
+            patch("jc_news.fetch_hn", new_callable=AsyncMock, return_value=fake_md),
+            patch("jc_news.query", side_effect=mock_query) as patched_query,
+        ):
+            session = AsyncMock()
+            result = asyncio.run(summarize_hn(session))
+            expect(result, "returns summary text").to_equal(summary_text)
+            patched_query.assert_called_once()
+            call_kwargs = patched_query.call_args[1]
+            expect(call_kwargs["prompt"], "sends fetched markdown").to_equal(fake_md)
