@@ -3,5 +3,6 @@
   "ruff.lint.enable": true,
   "ruff.organizeImports": true,
   "python.languageServer": "None",
-  "python.analysis.enablePytestSupport": false
+  "python.analysis.enablePytestSupport": false,
+  "python.testing.pytestEnabled": false
 }

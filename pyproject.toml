@@ -20,3 +20,8 @@ dev = [
   "ty>=0.0.26",
   "tryke @ git+https://github.com/thejchap/tryke",
 ]
+
+[tool.ruff]
+select = ["ALL"]
+ignore = ["FBT"]
+per-file-ignores={ "tests/*" = ["D", "ANN201"] }
