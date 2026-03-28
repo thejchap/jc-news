@@ -1,0 +1,18 @@
+[project]
+name = "jc-news"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [{ name = "Justin Chapman", email = "commonmodestudio@gmail.com" }]
+requires-python = ">=3.13"
+dependencies = ["click>=8.3.1"]
+
+[project.scripts]
+jc-news = "jc_news:main"
+
+[build-system]
+requires = ["uv_build>=0.8.4,<0.9.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["ruff>=0.15.8", "tryke>=0.0.12", "ty>=0.0.26"]
