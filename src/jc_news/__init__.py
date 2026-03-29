@@ -7,6 +7,9 @@ The example module supplies one function, factorial().  For example,
 """
 
 import asyncio
+import logging
+import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -23,10 +26,40 @@ import weasyprint
 from bs4 import BeautifulSoup
 from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+log = logging.getLogger(__name__)
+
 _HN_API = "https://hacker-news.firebaseio.com/v0"
 _HN_TOP_N = 10
 _HN_TOP_COMMENTS = 5
 _ARTICLE_MAX_CHARS = 2000
+
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001f600-\U0001f64f"
+    "\U0001f300-\U0001f5ff"
+    "\U0001f680-\U0001f6ff"
+    "\U0001f1e0-\U0001f1ff"
+    "\U00002702-\U000027b0"
+    "\U000024c2-\U0001f251"
+    "\U0001f900-\U0001f9ff"
+    "\U0001fa00-\U0001fa6f"
+    "\U0001fa70-\U0001faff"
+    "\u200d"
+    "\ufe0f"
+    "]+",
+)
+_MULTI_SPACE_RE = re.compile(r"[ \t]+")
+_MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
+
+
+def _sanitize_text(text: str) -> str:
+    """Remove emojis and clean up whitespace."""
+    text = _EMOJI_RE.sub("", text)
+    text = _MULTI_SPACE_RE.sub(" ", text)
+    text = _MULTI_NEWLINE_RE.sub("\n\n", text)
+    return text.strip()
+
 
 _LAYOUT_CSS = """\
 @page {
@@ -74,10 +107,12 @@ async def _fetch_article_text(
 ) -> str:
     """Fetch a URL and extract readable text content."""
     try:
+        log.debug("Fetching article: %s", url)
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             resp.raise_for_status()
             html = await resp.text()
     except (aiohttp.ClientError, TimeoutError):
+        log.debug("Failed to fetch article: %s", url)
         return ""
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "nav", "header", "footer"]):
@@ -85,7 +120,7 @@ async def _fetch_article_text(
     article = soup.find("article") or soup.find("main") or soup.body
     if not article:
         return ""
-    text = article.get_text(separator="\n", strip=True)
+    text = _sanitize_text(article.get_text(separator="\n", strip=True))
     if len(text) > _ARTICLE_MAX_CHARS:
         text = text[:_ARTICLE_MAX_CHARS] + "..."
     return text
@@ -97,6 +132,7 @@ async def _fetch_comments(
 ) -> list[str]:
     """Fetch top comments by id, return list of comment texts."""
     comments: list[str] = []
+    log.debug("Fetching up to %d comments", min(len(kid_ids), _HN_TOP_COMMENTS))
     for kid_id in kid_ids[:_HN_TOP_COMMENTS]:
         async with session.get(f"{_HN_API}/item/{kid_id}.json") as resp:
             resp.raise_for_status()
@@ -106,7 +142,7 @@ async def _fetch_comments(
         text = item.get("text", "")
         if text:
             soup = BeautifulSoup(text, "html.parser")
-            clean = soup.get_text(separator=" ", strip=True)
+            clean = _sanitize_text(soup.get_text(separator=" ", strip=True))
             author = item.get("by", "unknown")
             comments.append(f"**{author}:** {clean}")
     return comments
@@ -134,7 +170,7 @@ async def _format_post(
             lines.append(f"\n{article_text}\n")
     elif post.get("text"):
         soup = BeautifulSoup(post["text"], "html.parser")
-        lines.append(f"\n{soup.get_text(separator=' ', strip=True)}\n")
+        lines.append(f"\n{_sanitize_text(soup.get_text(separator=' ', strip=True))}\n")
 
     kid_ids: list[int] = post.get("kids", [])
     if kid_ids:
@@ -156,7 +192,9 @@ _SUMMARIZE_SYSTEM = (
 
 async def summarize_hn(session: aiohttp.ClientSession) -> str:
     """Fetch top HN posts, then summarize each with comment sentiment via Claude."""
+    log.info("Fetching HN posts for summarization")
     md = await fetch_hn(session)
+    log.info("Sending %d chars to Claude for summarization", len(md))
     result: str = ""
     async for message in query(
         prompt=md,
@@ -175,9 +213,11 @@ async def summarize_hn(session: aiohttp.ClientSession) -> str:
 async def fetch_hn(session: aiohttp.ClientSession) -> str:
     """Fetch top 10 HN posts from the last 48 hours, return as markdown."""
     cutoff = time.time() - 48 * 60 * 60
+    log.info("Fetching top story IDs from HN")
     async with session.get(f"{_HN_API}/topstories.json") as resp:
         resp.raise_for_status()
         story_ids: list[int] = await resp.json()
+    log.info("Got %d story IDs, filtering to top %d", len(story_ids), _HN_TOP_N)
 
     posts: list[dict[str, Any]] = []
     for story_id in story_ids:
@@ -188,9 +228,12 @@ async def fetch_hn(session: aiohttp.ClientSession) -> str:
             item: dict[str, Any] = await resp.json()
         if item and item.get("time", 0) >= cutoff:
             posts.append(item)
+            log.debug("Accepted story %d (%d/%d)", story_id, len(posts), _HN_TOP_N)
+    log.info("Collected %d posts", len(posts))
 
     lines: list[str] = []
     for i, post in enumerate(posts, 1):
+        log.info("Processing post %d/%d: %s", i, len(posts), post.get("title", ""))
         lines.extend(await _format_post(session, i, post))
     return "\n".join(lines)
 
@@ -221,9 +264,29 @@ def main() -> None:
 
 @main.command("run")
 @click.option("--dry-run", is_flag=True, help="Fetch and summarize, without printing.")
+@click.option(
+    "--printer",
+    default=None,
+    help="Name of the printer. Defaults to the only printer if just one is available.",
+)
 @coro
-async def async_run(dry_run: bool) -> None:
+async def async_run(dry_run: bool, printer: str | None) -> None:
     """Fetch and summarizes HN/Twitter."""
+    log.info("Starting run (dry_run=%s)", dry_run)
+    async with aiohttp.ClientSession() as session:
+        md = await summarize_hn(session)
+    log.info("Summarization complete (%d chars)", len(md))
+    if dry_run:
+        click.echo(md)
+        return
+    try:
+        printer = printer or _find_default_printer()
+        pdf = layout_markdown(md)
+        log.info("PDF generated (%d bytes), sending to printer '%s'", len(pdf), printer)
+        print_content(pdf, printer)
+        click.echo(f"Sent to printer '{printer}'.")
+    except PrintingError as e:
+        raise click.ClickException(str(e)) from e
 
 
 @main.command("fetch-hn")

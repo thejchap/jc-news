@@ -3,14 +3,17 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from claude_agent_sdk import ResultMessage
+from click.testing import CliRunner
 from tryke import describe, expect, test
 
 from jc_news import (
     PrintingError,
     _find_cups,
+    _sanitize_text,
     fetch_hn,
     layout_markdown,
     list_printers,
+    main,
     print_content,
     summarize_hn,
 )
@@ -153,6 +156,34 @@ with describe("layout"):
     def test_layout_empty():
         result = layout_markdown("")
         expect(result[:5], "PDF header").to_equal(b"%PDF-")
+
+
+with describe("sanitize_text"):
+
+    @test("removes emojis")
+    def test_sanitize_emojis():
+        result = _sanitize_text("hello \U0001f600 world \U0001f680")
+        expect(result, "emojis removed").to_equal("hello world")
+
+    @test("collapses multiple spaces")
+    def test_sanitize_spaces():
+        result = _sanitize_text("hello    world\t\tfoo")
+        expect(result, "spaces collapsed").to_equal("hello world foo")
+
+    @test("collapses excessive newlines")
+    def test_sanitize_newlines():
+        result = _sanitize_text("hello\n\n\n\n\nworld")
+        expect(result, "newlines collapsed").to_equal("hello\n\nworld")
+
+    @test("strips leading and trailing whitespace")
+    def test_sanitize_strip():
+        result = _sanitize_text("  hello  ")
+        expect(result, "stripped").to_equal("hello")
+
+    @test("handles plain text unchanged")
+    def test_sanitize_plain():
+        result = _sanitize_text("Just normal text here.")
+        expect(result, "unchanged").to_equal("Just normal text here.")
 
 
 def _make_resp(
@@ -319,6 +350,81 @@ with describe("fetch_hn"):
         md = asyncio.run(fetch_hn(session))
         expect("alive_user" in md, "alive comment present").to_equal(True)
         expect("I am alive" in md, "alive text present").to_equal(True)
+
+
+with describe("run"):
+
+    @test("dry-run echoes summary to terminal without printing")
+    def test_run_dry_run():
+        fake_md = "## 1. Test Post\n100 points by alice\n"
+        with (
+            patch("jc_news.summarize_hn", new_callable=AsyncMock, return_value=fake_md),
+            patch("jc_news.print_content") as mock_print,
+            patch("jc_news.layout_markdown") as mock_layout,
+        ):
+            runner = CliRunner()
+            result = runner.invoke(main, ["run", "--dry-run"])
+            expect(result.exit_code, "exit code").to_equal(0)
+            expect(
+                "Test Post" in result.output,
+                "output contains summary",
+            ).to_equal(True)
+            mock_layout.assert_not_called()
+            mock_print.assert_not_called()
+
+    @test("non-dry-run generates PDF and sends to printer")
+    def test_run_prints():
+        fake_md = "## 1. Test Post\n100 points by alice\n"
+        fake_pdf = b"%PDF-1.4 fake"
+        with (
+            patch("jc_news.summarize_hn", new_callable=AsyncMock, return_value=fake_md),
+            patch("jc_news.layout_markdown", return_value=fake_pdf) as mock_layout,
+            patch("jc_news.print_content") as mock_print,
+            patch("jc_news._find_default_printer", return_value="TestPrinter"),
+        ):
+            runner = CliRunner()
+            result = runner.invoke(main, ["run"])
+            expect(result.exit_code, "exit code").to_equal(0)
+            mock_layout.assert_called_once_with(fake_md)
+            mock_print.assert_called_once_with(fake_pdf, "TestPrinter")
+            expect(
+                "Sent to printer 'TestPrinter'." in result.output,
+                "confirms print",
+            ).to_equal(True)
+
+    @test("explicit --printer skips default lookup")
+    def test_run_explicit_printer():
+        fake_md = "## Summary\n"
+        fake_pdf = b"%PDF-1.4 fake"
+        with (
+            patch("jc_news.summarize_hn", new_callable=AsyncMock, return_value=fake_md),
+            patch("jc_news.layout_markdown", return_value=fake_pdf),
+            patch("jc_news.print_content") as mock_print,
+            patch("jc_news._find_default_printer") as mock_default,
+        ):
+            runner = CliRunner()
+            result = runner.invoke(main, ["run", "--printer", "MyPrinter"])
+            expect(result.exit_code, "exit code").to_equal(0)
+            mock_default.assert_not_called()
+            mock_print.assert_called_once_with(fake_pdf, "MyPrinter")
+
+    @test("PrintingError becomes ClickException")
+    def test_run_printing_error():
+        fake_md = "## Summary\n"
+        with (
+            patch("jc_news.summarize_hn", new_callable=AsyncMock, return_value=fake_md),
+            patch(
+                "jc_news._find_default_printer",
+                side_effect=PrintingError("no printers found."),
+            ),
+        ):
+            runner = CliRunner()
+            result = runner.invoke(main, ["run"])
+            expect(result.exit_code != 0, "nonzero exit").to_equal(True)
+            expect(
+                "no printers found." in result.output,
+                "error message shown",
+            ).to_equal(True)
 
 
 with describe("summarize_hn"):
