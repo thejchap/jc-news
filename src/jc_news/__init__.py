@@ -17,7 +17,7 @@ import time
 from collections.abc import Callable, Coroutine
 from functools import wraps
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import aiohttp
 import click
@@ -242,6 +242,31 @@ class PrintingError(Exception):
     """Raised when a printing operation fails."""
 
 
+class _DryRunCommand(click.Command):
+    """Allows ``--dry-run`` (bare, defaults to markdown) and ``--dry-run=pdf``."""
+
+    _DRY_RUN_CHOICES: ClassVar[set[str]] = {"markdown", "pdf"}
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        new_args: list[str] = []
+        for i, arg in enumerate(args):
+            if arg == "--dry-run":
+                next_arg = args[i + 1] if i + 1 < len(args) else None
+                if next_arg is None or next_arg.startswith("-"):
+                    new_args.append("--dry-run=markdown")
+                    continue
+                if next_arg in self._DRY_RUN_CHOICES:
+                    new_args.append(f"--dry-run={next_arg}")
+                    args[i + 1] = ""  # consume it
+                    continue
+                new_args.append("--dry-run=markdown")
+            elif arg == "":
+                continue
+            else:
+                new_args.append(arg)
+        return super().parse_args(ctx, new_args)
+
+
 def coro[**P](
     f: Callable[P, Coroutine[Any, Any, Any]],
 ) -> Callable[P, Coroutine[Any, Any, Any]]:
@@ -262,22 +287,41 @@ def main() -> None:
     """Fetch some social media and prints it on my at-home printer."""
 
 
-@main.command("run")
-@click.option("--dry-run", is_flag=True, help="Fetch and summarize, without printing.")
+@main.command("run", cls=_DryRunCommand)
+@click.option(
+    "--dry-run",
+    type=click.Choice(["markdown", "pdf"], case_sensitive=False),
+    default=None,
+    help=(
+        "Fetch and summarize, without printing."
+        " 'markdown' (default) echoes to terminal;"
+        " 'pdf' writes to a temp file."
+    ),
+)
 @click.option(
     "--printer",
     default=None,
     help="Name of the printer. Defaults to the only printer if just one is available.",
 )
 @coro
-async def async_run(dry_run: bool, printer: str | None) -> None:
+async def async_run(dry_run: str | None, printer: str | None) -> None:
     """Fetch and summarizes HN/Twitter."""
     log.info("Starting run (dry_run=%s)", dry_run)
     async with aiohttp.ClientSession() as session:
         md = await summarize_hn(session)
     log.info("Summarization complete (%d chars)", len(md))
-    if dry_run:
+    if dry_run == "markdown":
         click.echo(md)
+        return
+    if dry_run == "pdf":
+        pdf = layout_markdown(md)
+        with tempfile.NamedTemporaryFile(
+            suffix=".pdf",
+            delete=False,
+            prefix="jc-news-",
+        ) as f:
+            f.write(pdf)
+        click.echo(f.name)
         return
     try:
         printer = printer or _find_default_printer()

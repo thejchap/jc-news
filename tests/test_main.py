@@ -354,7 +354,7 @@ with describe("fetch_hn"):
 
 with describe("run"):
 
-    @test("dry-run echoes summary to terminal without printing")
+    @test("dry-run defaults to markdown and echoes summary to terminal")
     def test_run_dry_run():
         fake_md = "## 1. Test Post\n100 points by alice\n"
         with (
@@ -371,6 +371,41 @@ with describe("run"):
             ).to_equal(True)
             mock_layout.assert_not_called()
             mock_print.assert_not_called()
+
+    @test("dry-run=markdown echoes summary to terminal without printing")
+    def test_run_dry_run_markdown():
+        fake_md = "## 1. Test Post\n100 points by alice\n"
+        with (
+            patch("jc_news.summarize_hn", new_callable=AsyncMock, return_value=fake_md),
+            patch("jc_news.print_content") as mock_print,
+            patch("jc_news.layout_markdown") as mock_layout,
+        ):
+            runner = CliRunner()
+            result = runner.invoke(main, ["run", "--dry-run=markdown"])
+            expect(result.exit_code, "exit code").to_equal(0)
+            expect(
+                "Test Post" in result.output,
+                "output contains summary",
+            ).to_equal(True)
+            mock_layout.assert_not_called()
+            mock_print.assert_not_called()
+
+    @test("dry-run=pdf writes PDF to temp file and prints path")
+    def test_run_dry_run_pdf():
+        fake_md = "## 1. Test Post\n100 points by alice\n"
+        fake_pdf = b"%PDF-1.4 fake"
+        with (
+            patch("jc_news.summarize_hn", new_callable=AsyncMock, return_value=fake_md),
+            patch("jc_news.layout_markdown", return_value=fake_pdf) as mock_layout,
+            patch("jc_news.print_content") as mock_print,
+        ):
+            runner = CliRunner()
+            result = runner.invoke(main, ["run", "--dry-run=pdf"])
+            expect(result.exit_code, "exit code").to_equal(0)
+            mock_layout.assert_called_once_with(fake_md)
+            mock_print.assert_not_called()
+            path = result.output.strip()
+            expect(path.endswith(".pdf"), "output is a pdf path").to_equal(True)
 
     @test("non-dry-run generates PDF and sends to printer")
     def test_run_prints():
