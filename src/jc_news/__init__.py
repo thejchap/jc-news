@@ -64,25 +64,25 @@ def _sanitize_text(text: str) -> str:
 _LAYOUT_CSS = """\
 @page {
     size: letter;
-    margin: 0.75in;
+    margin: 0.35in 0.4in;
 }
 body {
     column-count: 2;
-    column-gap: 0.3in;
-    column-rule: 1px solid #ccc;
-    font-family: 'Courier New', Courier, monospace;
-    font-size: 10pt;
-    line-height: 1.4;
+    column-gap: 0.2in;
+    column-rule: 1px solid #999;
+    font-family: 'Georgia', 'Times New Roman', Times, serif;
+    font-size: 7.5pt;
+    line-height: 1.15;
     margin: 0;
     padding: 0;
 }
-h1 { font-size: 16pt; font-weight: bold; margin: 0.3em 0; }
-h2 { font-size: 13pt; font-weight: bold; margin: 0.3em 0; }
-h3 { font-size: 11pt; font-weight: bold; margin: 0.3em 0; }
-ul, ol { margin: 0.2em 0; padding-left: 1.2em; }
-li { margin: 0.1em 0; }
-hr { border: none; border-top: 1px solid #999; margin: 0.5em 0; }
-p { margin: 0.3em 0; }
+h1 { display: none; }
+h2 { font-size: 9pt; font-weight: bold; margin: 0.15em 0; }
+h3 { font-size: 8pt; font-weight: bold; margin: 0.1em 0; }
+ul, ol { margin: 0.1em 0; padding-left: 1em; }
+li { margin: 0; }
+hr { border: none; border-top: 0.5px solid #999; margin: 0.3em 0; }
+p { margin: 0.15em 0; }
 """
 
 _LAYOUT_HTML = """\
@@ -305,7 +305,7 @@ def main() -> None:
 )
 @coro
 async def async_run(dry_run: str | None, printer: str | None) -> None:
-    """Fetch and summarizes HN/Twitter."""
+    """Fetch and summarize HN."""
     log.info("Starting run (dry_run=%s)", dry_run)
     async with aiohttp.ClientSession() as session:
         md = await summarize_hn(session)
@@ -349,13 +349,6 @@ async def async_fetch_hn() -> None:
         click.echo(f"Wrote {f.name}")
 
 
-@main.command("fetch-twitter")
-@coro
-async def async_fetch_twitter() -> None:
-    """Fetch Twitter feed, writes contents and comments to a temporary markdown file."""
-    raise NotImplementedError
-
-
 @main.command("summarize-hn")
 @coro
 async def async_summarize_hn() -> None:
@@ -370,13 +363,6 @@ async def async_summarize_hn() -> None:
     ) as f:
         f.write(md)
         click.echo(f"Wrote {f.name}")
-
-
-@main.command("summarize-twitter")
-@coro
-async def async_summarize_twitter() -> None:
-    """Summarizes Twitter feed in markdown file."""
-    raise NotImplementedError
 
 
 @main.command("print")
