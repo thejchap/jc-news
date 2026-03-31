@@ -22,7 +22,7 @@ from typing import Any, ClassVar
 import aiohttp
 import click
 import mistune
-import weasyprint
+import pdfun
 from bs4 import BeautifulSoup
 from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
@@ -98,7 +98,7 @@ def layout_markdown(content: str) -> bytes:
     """Convert markdown to newspaper-style PDF bytes for 8.5x11 paper."""
     html_body = mistune.html(content)
     full_html = _LAYOUT_HTML.format(css=_LAYOUT_CSS, content=html_body)
-    return weasyprint.HTML(string=full_html).write_pdf()
+    return pdfun.HtmlDocument(string=full_html).to_bytes()
 
 
 async def _fetch_article_text(
