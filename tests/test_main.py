@@ -2,7 +2,6 @@ import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from claude_agent_sdk import ResultMessage
 from click.testing import CliRunner
 from tryke import describe, expect, test
 
@@ -300,10 +299,10 @@ with describe("fetch_hn"):
         expect("Old Post" in md, "old post excluded").to_equal(False)
         expect("New Post" in md, "new post included").to_equal(True)
 
-    @test("limits to 10 posts")
-    def test_fetch_hn_limit_10():
+    @test("limits to 20 posts")
+    def test_fetch_hn_limit_20():
         now = int(time.time())
-        ids = list(range(1, 16))
+        ids = list(range(1, 26))
         items = [
             {
                 "id": i,
@@ -319,8 +318,8 @@ with describe("fetch_hn"):
         responses.extend(_make_resp(json_data=item) for item in items)
         session = _make_mock_session(responses)
         md = asyncio.run(fetch_hn(session))
-        expect("Post 10" in md, "has 10th post").to_equal(True)
-        expect("Post 11" in md, "no 11th post").to_equal(False)
+        expect("Post 20" in md, "has 20th post").to_equal(True)
+        expect("Post 21" in md, "no 21st post").to_equal(False)
 
     @test("skips deleted and dead comments")
     def test_fetch_hn_skips_bad_comments():
@@ -464,34 +463,48 @@ with describe("run"):
 
 with describe("summarize_hn"):
 
-    @test("calls fetch_hn then sends markdown to Claude for summarization")
+    @test("fetches posts, summarizes each, and assembles markdown")
     def test_summarize_hn_basic():
-        fake_md = "## 1. Test Post\n100 points by alice\n\nArticle text.\n"
-        summary_text = (
-            "## Test Post\nSummary: A test post about articles.\n"
-            "Comment Sentiment: Generally positive.\n"
-        )
-        result_msg = ResultMessage(
-            result=summary_text,
-            stop_reason="end_turn",
-            subtype="result",
-            duration_ms=100,
-            duration_api_ms=80,
-            is_error=False,
-            num_turns=1,
-            session_id="test-session",
-        )
-
-        async def mock_query(*_args: object, **_kwargs: object):  # noqa: ANN202
-            yield result_msg
-
+        now = int(time.time())
+        posts = [
+            {
+                "id": 1,
+                "title": "Post One",
+                "url": "",
+                "score": 10,
+                "by": "a",
+                "time": now,
+            },
+            {
+                "id": 2,
+                "title": "Post Two",
+                "url": "",
+                "score": 20,
+                "by": "b",
+                "time": now,
+            },
+        ]
         with (
-            patch("jc_news.fetch_hn", new_callable=AsyncMock, return_value=fake_md),
-            patch("jc_news.query", side_effect=mock_query) as patched_query,
+            patch(
+                "jc_news._fetch_hn_posts",
+                new_callable=AsyncMock,
+                return_value=posts,
+            ),
+            patch(
+                "jc_news._format_post",
+                new_callable=AsyncMock,
+                side_effect=["md1", "md2"],
+            ),
+            patch(
+                "jc_news._summarize_post",
+                new_callable=AsyncMock,
+                side_effect=["Summary one.", "Summary two."],
+            ),
         ):
             session = AsyncMock()
             result = asyncio.run(summarize_hn(session))
-            expect(result, "returns summary text").to_equal(summary_text)
-            patched_query.assert_called_once()
-            call_kwargs = patched_query.call_args[1]
-            expect(call_kwargs["prompt"], "sends fetched markdown").to_equal(fake_md)
+            expect("## 1. Post One" in result, "has first heading").to_equal(True)
+            expect("## 2. Post Two" in result, "has second heading").to_equal(True)
+            expect("Summary one." in result, "has first summary").to_equal(True)
+            expect("Summary two." in result, "has second summary").to_equal(True)
+            expect("---" in result, "sections separated by hr").to_equal(True)

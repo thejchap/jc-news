@@ -1,10 +1,4 @@
-"""jc-news: Fetch some social media and prints it on my at-home printer.
-
-The example module supplies one function, factorial().  For example,
-
->>> 1 + 1
-2
-"""
+"""jc-news: A CLI tool to fetch top Hacker News posts, summarize them and print them."""
 
 import asyncio
 import logging
@@ -20,6 +14,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import aiohttp
+import anthropic
 import click
 import mistune
 import pdfun
@@ -30,7 +25,7 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger(__name__)
 
 _HN_API = "https://hacker-news.firebaseio.com/v0"
-_HN_TOP_N = 10
+_HN_TOP_N = 20
 _HN_TOP_COMMENTS = 5
 _ARTICLE_MAX_CHARS = 2000
 
@@ -64,25 +59,25 @@ def _sanitize_text(text: str) -> str:
 _LAYOUT_CSS = """\
 @page {
     size: letter;
-    margin: 0.35in 0.4in;
+    margin: 0.25in 0.3in;
 }
 body {
     column-count: 2;
     column-gap: 0.2in;
     column-rule: 1px solid #999;
-    font-family: 'Georgia', 'Times New Roman', Times, serif;
+    font-family: 'Courier New', Courier, monospace;
     font-size: 7.5pt;
-    line-height: 1.15;
+    line-height: 1.1;
     margin: 0;
     padding: 0;
 }
 h1 { display: none; }
-h2 { font-size: 9pt; font-weight: bold; margin: 0.15em 0; }
-h3 { font-size: 8pt; font-weight: bold; margin: 0.1em 0; }
+h2 { font-size: 8.5pt; font-weight: bold; margin: 0.05em 0; }
+h3 { font-size: 8pt; font-weight: bold; margin: 0.05em 0; }
 ul, ol { margin: 0.1em 0; padding-left: 1em; }
 li { margin: 0; }
-hr { border: none; border-top: 0.5px solid #999; margin: 0.3em 0; }
-p { margin: 0.15em 0; }
+hr { border: none; border-top: 0.5px solid #999; margin: 0.15em 0; }
+p { margin: 0.1em 0; }
 """
 
 _LAYOUT_HTML = """\
@@ -94,11 +89,29 @@ _LAYOUT_HTML = """\
 """
 
 
+def _pdf_page_count(pdf_bytes: bytes) -> int:
+    """Count pages in a PDF by matching /Type /Page (not /Pages) markers."""
+    return len(re.findall(rb"/Type\s*/Page(?!\w)", pdf_bytes))
+
+
 def layout_markdown(content: str) -> bytes:
-    """Convert markdown to newspaper-style PDF bytes for 8.5x11 paper."""
-    html_body = mistune.html(content)
-    full_html = _LAYOUT_HTML.format(css=_LAYOUT_CSS, content=html_body)
-    return pdfun.HtmlDocument(string=full_html).to_bytes()
+    """Convert markdown to newspaper-style PDF bytes for 8.5x11 paper.
+
+    Truncates articles so the output fits on a single page.
+    """
+    # split on horizontal rules that separate articles
+    sections = re.split(r"(?m)^---$", content)
+    header = sections[0] if sections else ""
+    articles = sections[1:] if len(sections) > 1 else []
+
+    while True:
+        md = ("---".join([header, *articles])).strip()
+        html_body = mistune.html(md)
+        full_html = _LAYOUT_HTML.format(css=_LAYOUT_CSS, content=html_body)
+        pdf_bytes = pdfun.HtmlDocument(string=full_html).to_bytes()
+        if _pdf_page_count(pdf_bytes) <= 2 or not articles:  # noqa: PLR2004
+            return pdf_bytes
+        articles.pop()
 
 
 async def _fetch_article_text(
@@ -150,16 +163,15 @@ async def _fetch_comments(
 
 async def _format_post(
     session: aiohttp.ClientSession,
-    i: int,
     post: dict[str, Any],
-) -> list[str]:
-    """Render a single HN post as markdown lines."""
+) -> str:
+    """Render a single HN post as markdown (unnumbered, no trailing separator)."""
     title = post.get("title", "Untitled")
     url = post.get("url", "")
     score = post.get("score", 0)
     author = post.get("by", "unknown")
 
-    lines: list[str] = [f"## {i}. {title}\n"]
+    lines: list[str] = [f"## {title}\n"]
     if url:
         lines.append(f"{url}\n")
     lines.append(f"{score} points by {author}\n")
@@ -179,25 +191,41 @@ async def _format_post(
             lines.append("\n### Comments\n")
             lines.extend(f"- {c}\n" for c in comments)
 
-    lines.append("\n---\n")
-    return lines
+    return "\n".join(lines)
 
 
 _SUMMARIZE_SYSTEM = (
-    "You are a news summarizer. For each Hacker News post, write a 1-2 sentence "
-    "summary of the post and a brief note on the sentiment of the comments. "
-    "Use markdown formatting with the post title as a heading."
+    "You are a news summarizer. Given a single Hacker News post with its article "
+    "text and comments, write a 1-2 sentence summary of the article and a brief "
+    "note on the comment sentiment. Output plain text only, no headings or markdown "
+    "formatting."
 )
 
 
-async def summarize_hn(session: aiohttp.ClientSession) -> str:
-    """Fetch top HN posts, then summarize each with comment sentiment via Claude."""
-    log.info("Fetching HN posts for summarization")
-    md = await fetch_hn(session)
-    log.info("Sending %d chars to Claude for summarization", len(md))
+async def _summarize_post_api(title: str, post_md: str) -> str:
+    """Summarize via the Anthropic API using ANTHROPIC_API_KEY."""
+    log.info("Summarizing (api): %s", title)
+    client = anthropic.AsyncAnthropic()
+    message = await client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1024,
+        system=_SUMMARIZE_SYSTEM,
+        messages=[{"role": "user", "content": post_md}],
+    )
+    block = message.content[0] if message.content else None
+    result: str = (
+        block.text if block and isinstance(block, anthropic.types.TextBlock) else ""
+    )
+    log.info("Summarized: %s (%d chars)", title, len(result))
+    return result.strip()
+
+
+async def _summarize_post_sdk(title: str, post_md: str) -> str:
+    """Summarize via the Claude Agent SDK (requires Claude Code CLI)."""
+    log.info("Summarizing (sdk): %s", title)
     result: str = ""
     async for message in query(
-        prompt=md,
+        prompt=post_md,
         options=ClaudeAgentOptions(
             system_prompt=_SUMMARIZE_SYSTEM,
             model="claude-haiku-4-5",
@@ -207,11 +235,21 @@ async def summarize_hn(session: aiohttp.ClientSession) -> str:
     ):
         if isinstance(message, ResultMessage) and message.result:
             result = message.result
-    return result
+    log.info("Summarized: %s (%d chars)", title, len(result))
+    return result.strip()
 
 
-async def fetch_hn(session: aiohttp.ClientSession) -> str:
-    """Fetch top 10 HN posts from the last 48 hours, return as markdown."""
+async def _summarize_post(title: str, post_md: str) -> str:
+    """Summarize a single post's markdown via Claude."""
+    if os.getenv("ANTHROPIC_API_KEY"):
+        return await _summarize_post_api(title, post_md)
+    return await _summarize_post_sdk(title, post_md)
+
+
+async def _fetch_hn_posts(
+    session: aiohttp.ClientSession,
+) -> list[dict[str, Any]]:
+    """Fetch top HN posts from the last 48 hours."""
     cutoff = time.time() - 48 * 60 * 60
     log.info("Fetching top story IDs from HN")
     async with session.get(f"{_HN_API}/topstories.json") as resp:
@@ -230,12 +268,44 @@ async def fetch_hn(session: aiohttp.ClientSession) -> str:
             posts.append(item)
             log.debug("Accepted story %d (%d/%d)", story_id, len(posts), _HN_TOP_N)
     log.info("Collected %d posts", len(posts))
+    return posts
 
-    lines: list[str] = []
+
+async def summarize_hn(session: aiohttp.ClientSession) -> str:
+    """Fetch top HN posts, summarize each individually, assemble deterministically."""
+    posts = await _fetch_hn_posts(session)
+
+    # fetch and format each post's content
+    post_mds: list[str] = []
     for i, post in enumerate(posts, 1):
         log.info("Processing post %d/%d: %s", i, len(posts), post.get("title", ""))
-        lines.extend(await _format_post(session, i, post))
-    return "\n".join(lines)
+        post_mds.append(await _format_post(session, post))
+
+    # summarize all posts concurrently
+    log.info("Summarizing %d posts via Claude", len(post_mds))
+    summaries = await asyncio.gather(
+        *[
+            _summarize_post(p.get("title", "Untitled"), md)
+            for p, md in zip(posts, post_mds, strict=False)
+        ],
+    )
+
+    # deterministic assembly
+    sections: list[str] = []
+    for i, (post, summary) in enumerate(zip(posts, summaries, strict=False), 1):
+        title = post.get("title", "Untitled")
+        sections.append(f"## {i}. {title}\n\n{summary}")
+    return "\n\n---\n\n".join(sections)
+
+
+async def fetch_hn(session: aiohttp.ClientSession) -> str:
+    """Fetch top 10 HN posts from the last 48 hours, return as markdown."""
+    posts = await _fetch_hn_posts(session)
+    sections: list[str] = []
+    for i, post in enumerate(posts, 1):
+        log.info("Processing post %d/%d: %s", i, len(posts), post.get("title", ""))
+        sections.append(await _format_post(session, post))
+    return "\n\n---\n\n".join(sections)
 
 
 class PrintingError(Exception):

@@ -6,12 +6,13 @@ readme = "README.md"
 authors = [{ name = "Justin Chapman", email = "commonmodestudio@gmail.com" }]
 requires-python = ">=3.13"
 dependencies = [
-    "aiohttp>=3.11.0",
-    "beautifulsoup4>=4.13.0",
-    "claude-agent-sdk",
-    "click>=8.3.1",
-    "mistune>=3.1.0",
-    "pdfun",
+  "aiohttp==3.11",
+  "beautifulsoup4==4.13",
+  "anthropic>=0.52",
+  "claude-agent-sdk==0.1",
+  "click==8.3.1",
+  "mistune==3.1.0",
+  "pdfun",
 ]
 
 [project.scripts]
@@ -29,9 +30,9 @@ dev = [
 ]
 
 [tool.ruff]
-select = ["ALL"]
-ignore = ["FBT"]
-per-file-ignores={ "tests/*" = ["D", "ANN201"] }
+lint.select = ["ALL"]
+lint.ignore = ["FBT", "D203", "D213", "COM812", "ISC001"]
+lint.per-file-ignores = { "tests/*" = ["D", "ANN201"] }
 
 [tool.uv.sources]
 pdfun = { git = "https://github.com/thejchap/pdfun.git" }

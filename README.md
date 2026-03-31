@@ -1,7 +1,32 @@
-
 # jc news
 
+jc news is a script that summarizes the top 10-ish posts on hacker news,
+then prints to a printer on your local network! the hacker news(paper).
+
+## getting started
+
+this can be run easily via `uvx` if you have [uv](https://docs.astral.sh/uv/) installed.
+
+```bash
+# make sure we have a printer
+uvx --from git+https://github.com/thejchap/jc-news jc-news list-printers
+
+# dry run pdf generation
+uvx --from git+https://github.com/thejchap/jc-news jc-news run --dry-run=pdf
+
+# print it!
+uvx --from git+https://github.com/thejchap/jc-news jc-news run
+```
+
+### summarization
+
+you need to either be logged in to claude code via a pro account,
+or have an `ANTHROPIC_API_KEY` environment variable set.
+the script uses the anthropic api for summarization.
+
 ## contributing
+
+prs welcome
 
 ### verification
 
