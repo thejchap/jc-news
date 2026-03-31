@@ -8,10 +8,13 @@ import shutil
 import subprocess
 import tempfile
 import time
+import unicodedata
 from collections.abc import Callable, Coroutine
+from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 import anthropic
@@ -29,31 +32,34 @@ _HN_TOP_N = 20
 _HN_TOP_COMMENTS = 5
 _ARTICLE_MAX_CHARS = 2000
 
-_EMOJI_RE = re.compile(
-    "["
-    "\U0001f600-\U0001f64f"
-    "\U0001f300-\U0001f5ff"
-    "\U0001f680-\U0001f6ff"
-    "\U0001f1e0-\U0001f1ff"
-    "\U00002702-\U000027b0"
-    "\U000024c2-\U0001f251"
-    "\U0001f900-\U0001f9ff"
-    "\U0001fa00-\U0001fa6f"
-    "\U0001fa70-\U0001faff"
-    "\u200d"
-    "\ufe0f"
-    "]+",
-)
+_EMOJI_CATEGORIES = {"So", "Sk"}
+_EMOJI_FORMAT_CHARS = frozenset("\u200d\ufe0f")
 _MULTI_SPACE_RE = re.compile(r"[ \t]+")
 _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 
 
+def _strip_emojis(text: str) -> str:
+    """Remove emoji and emoji-related format characters via unicode category."""
+    return "".join(
+        c
+        for c in text
+        if c not in _EMOJI_FORMAT_CHARS
+        and unicodedata.category(c) not in _EMOJI_CATEGORIES
+    )
+
+
 def _sanitize_text(text: str) -> str:
     """Remove emojis and clean up whitespace."""
-    text = _EMOJI_RE.sub("", text)
+    text = _strip_emojis(text)
     text = _MULTI_SPACE_RE.sub(" ", text)
     text = _MULTI_NEWLINE_RE.sub("\n\n", text)
     return text.strip()
+
+
+def _extract_domain(url: str) -> str:
+    """Extract the domain from a URL, stripping www. prefix."""
+    host = urlparse(url).hostname or ""
+    return host.removeprefix("www.")
 
 
 _LAYOUT_CSS = """\
@@ -78,6 +84,7 @@ ul, ol { margin: 0.1em 0; padding-left: 1em; }
 li { margin: 0; }
 hr { border: none; border-top: 0.5px solid #999; margin: 0.15em 0; }
 p { margin: 0.1em 0; }
+.date { column-span: all; font-size: 6pt; text-align: right; margin: 0; color: #666; }
 """
 
 _LAYOUT_HTML = """\
@@ -104,10 +111,16 @@ def layout_markdown(content: str) -> bytes:
     header = sections[0] if sections else ""
     articles = sections[1:] if len(sections) > 1 else []
 
+    now = datetime.now(tz=UTC)
+    date_html = f'<div class="date">{now.strftime("%B")} {now.day}, {now.year}</div>'
+
     while True:
         md = ("---".join([header, *articles])).strip()
-        html_body = mistune.html(md)
-        full_html = _LAYOUT_HTML.format(css=_LAYOUT_CSS, content=html_body)
+        html_body = str(mistune.html(md))
+        full_html = _LAYOUT_HTML.format(
+            css=_LAYOUT_CSS,
+            content=date_html + html_body,
+        )
         pdf_bytes = pdfun.HtmlDocument(string=full_html).to_bytes()
         if _pdf_page_count(pdf_bytes) <= 2 or not articles:  # noqa: PLR2004
             return pdf_bytes
@@ -257,16 +270,19 @@ async def _fetch_hn_posts(
         story_ids: list[int] = await resp.json()
     log.info("Got %d story IDs, filtering to top %d", len(story_ids), _HN_TOP_N)
 
-    posts: list[dict[str, Any]] = []
-    for story_id in story_ids:
-        if len(posts) >= _HN_TOP_N:
-            break
+    # fetch a batch in parallel, then filter by recency
+    batch = story_ids[: _HN_TOP_N * 3]
+
+    async def _fetch_item(story_id: int) -> dict[str, Any] | None:
         async with session.get(f"{_HN_API}/item/{story_id}.json") as resp:
             resp.raise_for_status()
             item: dict[str, Any] = await resp.json()
         if item and item.get("time", 0) >= cutoff:
-            posts.append(item)
-            log.debug("Accepted story %d (%d/%d)", story_id, len(posts), _HN_TOP_N)
+            return item
+        return None
+
+    results = await asyncio.gather(*(_fetch_item(sid) for sid in batch))
+    posts = [r for r in results if r is not None][:_HN_TOP_N]
     log.info("Collected %d posts", len(posts))
     return posts
 
@@ -274,14 +290,10 @@ async def _fetch_hn_posts(
 async def summarize_hn(session: aiohttp.ClientSession) -> str:
     """Fetch top HN posts, summarize each individually, assemble deterministically."""
     posts = await _fetch_hn_posts(session)
-
-    # fetch and format each post's content
-    post_mds: list[str] = []
-    for i, post in enumerate(posts, 1):
-        log.info("Processing post %d/%d: %s", i, len(posts), post.get("title", ""))
-        post_mds.append(await _format_post(session, post))
-
-    # summarize all posts concurrently
+    log.info("Formatting %d posts in parallel", len(posts))
+    post_mds = list(
+        await asyncio.gather(*(_format_post(session, post) for post in posts)),
+    )
     log.info("Summarizing %d posts via Claude", len(post_mds))
     summaries = await asyncio.gather(
         *[
@@ -289,52 +301,31 @@ async def summarize_hn(session: aiohttp.ClientSession) -> str:
             for p, md in zip(posts, post_mds, strict=False)
         ],
     )
-
-    # deterministic assembly
     sections: list[str] = []
     for i, (post, summary) in enumerate(zip(posts, summaries, strict=False), 1):
         title = post.get("title", "Untitled")
-        sections.append(f"## {i}. {title}\n\n{summary}")
+        url = post.get("url", "")
+        domain = _extract_domain(url) if url else ""
+        if domain:
+            heading = f"## {i}. {title}\n\n{domain}\n\n"
+        else:
+            heading = f"## {i}. {title}\n\n"
+        sections.append(f"{heading}{summary}")
     return "\n\n---\n\n".join(sections)
 
 
 async def fetch_hn(session: aiohttp.ClientSession) -> str:
     """Fetch top 10 HN posts from the last 48 hours, return as markdown."""
     posts = await _fetch_hn_posts(session)
-    sections: list[str] = []
-    for i, post in enumerate(posts, 1):
-        log.info("Processing post %d/%d: %s", i, len(posts), post.get("title", ""))
-        sections.append(await _format_post(session, post))
+    log.info("Formatting %d posts in parallel", len(posts))
+    sections = list(
+        await asyncio.gather(*(_format_post(session, post) for post in posts)),
+    )
     return "\n\n---\n\n".join(sections)
 
 
 class PrintingError(Exception):
     """Raised when a printing operation fails."""
-
-
-class _DryRunCommand(click.Command):
-    """Allows ``--dry-run`` (bare, defaults to markdown) and ``--dry-run=pdf``."""
-
-    _DRY_RUN_CHOICES: ClassVar[set[str]] = {"markdown", "pdf"}
-
-    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
-        new_args: list[str] = []
-        for i, arg in enumerate(args):
-            if arg == "--dry-run":
-                next_arg = args[i + 1] if i + 1 < len(args) else None
-                if next_arg is None or next_arg.startswith("-"):
-                    new_args.append("--dry-run=markdown")
-                    continue
-                if next_arg in self._DRY_RUN_CHOICES:
-                    new_args.append(f"--dry-run={next_arg}")
-                    args[i + 1] = ""  # consume it
-                    continue
-                new_args.append("--dry-run=markdown")
-            elif arg == "":
-                continue
-            else:
-                new_args.append(arg)
-        return super().parse_args(ctx, new_args)
 
 
 def coro[**P](
@@ -357,14 +348,14 @@ def main() -> None:
     """Fetch some social media and prints it on my at-home printer."""
 
 
-@main.command("run", cls=_DryRunCommand)
+@main.command("run")
 @click.option(
     "--dry-run",
     type=click.Choice(["markdown", "pdf"], case_sensitive=False),
     default=None,
     help=(
         "Fetch and summarize, without printing."
-        " 'markdown' (default) echoes to terminal;"
+        " 'markdown' echoes to terminal;"
         " 'pdf' writes to a temp file."
     ),
 )

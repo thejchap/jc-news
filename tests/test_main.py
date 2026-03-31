@@ -353,7 +353,7 @@ with describe("fetch_hn"):
 
 with describe("run"):
 
-    @test("dry-run defaults to markdown and echoes summary to terminal")
+    @test("dry-run markdown echoes summary to terminal")
     def test_run_dry_run():
         fake_md = "## 1. Test Post\n100 points by alice\n"
         with (
@@ -362,7 +362,7 @@ with describe("run"):
             patch("jc_news.layout_markdown") as mock_layout,
         ):
             runner = CliRunner()
-            result = runner.invoke(main, ["run", "--dry-run"])
+            result = runner.invoke(main, ["run", "--dry-run", "markdown"])
             expect(result.exit_code, "exit code").to_equal(0)
             expect(
                 "Test Post" in result.output,

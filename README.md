@@ -31,8 +31,14 @@ prs welcome
 ### verification
 
 ```bash
+
+# run the tests
 uv run tryke test
+
+# run the type checker
 uv run ty check
+
+# linting/formatting
 uv run ruff check
 uv run ruff format --check
 
