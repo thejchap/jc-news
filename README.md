@@ -1,6 +1,6 @@
 # jc news
 
-jc news is a script that summarizes the top 10-ish posts on hacker news,
+jc news is a script that summarizes the top 20-ish posts on hacker news,
 then prints to a printer on your local network! the hacker news(paper).
 
 ## getting started
