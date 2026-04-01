@@ -3,6 +3,8 @@
 jc news is a script that summarizes the top 20-ish posts on hacker news,
 then prints to a printer on your local network! the hacker news(paper).
 
+<img src="https://github.com/user-attachments/assets/49a454ec-95fb-4ccb-90cc-03d42a6f86b4" alt="jc-news" width="200"/>
+
 ## getting started
 
 this can be run easily via `uvx` if you have [uv](https://docs.astral.sh/uv/) installed.
