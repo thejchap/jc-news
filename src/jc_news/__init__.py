@@ -31,6 +31,7 @@ _HN_API = "https://hacker-news.firebaseio.com/v0"
 _HN_TOP_N = 20
 _HN_TOP_COMMENTS = 5
 _ARTICLE_MAX_CHARS = 2000
+_SUMMARIZE_CONCURRENCY = 5
 
 _EMOJI_CATEGORIES = {"So", "Sk"}
 _EMOJI_FORMAT_CHARS = frozenset("\u200d\ufe0f")
@@ -137,7 +138,7 @@ async def _fetch_article_text(
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             resp.raise_for_status()
             html = await resp.text()
-    except (aiohttp.ClientError, TimeoutError):
+    except (aiohttp.ClientError, TimeoutError, UnicodeDecodeError):
         log.debug("Failed to fetch article: %s", url)
         return ""
     soup = BeautifulSoup(html, "html.parser")
@@ -242,8 +243,9 @@ async def _summarize_post_sdk(title: str, post_md: str) -> str:
         options=ClaudeAgentOptions(
             system_prompt=_SUMMARIZE_SYSTEM,
             model="claude-haiku-4-5",
-            allowed_tools=[],
-            max_turns=1,
+            max_turns=2,
+            allowed_tools=["WebFetch"],
+            permission_mode="bypassPermissions",
         ),
     ):
         if isinstance(message, ResultMessage) and message.result:
@@ -252,11 +254,19 @@ async def _summarize_post_sdk(title: str, post_md: str) -> str:
     return result.strip()
 
 
+_summarize_sem = asyncio.Semaphore(_SUMMARIZE_CONCURRENCY)
+
+
 async def _summarize_post(title: str, post_md: str) -> str:
     """Summarize a single post's markdown via Claude."""
-    if os.getenv("ANTHROPIC_API_KEY"):
-        return await _summarize_post_api(title, post_md)
-    return await _summarize_post_sdk(title, post_md)
+    async with _summarize_sem:
+        try:
+            if os.getenv("ANTHROPIC_API_KEY"):
+                return await _summarize_post_api(title, post_md)
+            return await _summarize_post_sdk(title, post_md)
+        except Exception:  # noqa: BLE001 - sdk raises bare Exception
+            log.warning("failed to summarize: %s", title, exc_info=True)
+            return ""
 
 
 async def _fetch_hn_posts(
